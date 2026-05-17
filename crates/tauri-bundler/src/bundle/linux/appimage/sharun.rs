@@ -104,6 +104,15 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     _ => "",
   };
 
+  // Copy the deb-style data tree (resources, icons, .desktop, …) generated
+  // by `debian::generate_data` into the AppDir before quick-sharun packages
+  // it. Without this, the AppImage ships only the binary + its dynamic libs
+  // and every `bundle.resources` glob is silently dropped, breaking apps
+  // that read files via `BaseDirectory::Resource`. Mirrors the equivalent
+  // `fs_utils::copy_dir(&data_dir.join("usr/"), &app_dir_usr)?;` line in the
+  // legacy linuxdeploy bundler.
+  fs_utils::copy_dir(&data_dir.join("usr/"), &app_dir_path.join("usr/"))?;
+
   let bins = settings.copy_binaries(&app_dir_path.join("usr/bin/"))?;
   let bins = bins
     .iter()
