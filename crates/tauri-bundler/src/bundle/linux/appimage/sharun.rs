@@ -113,6 +113,34 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   // legacy linuxdeploy bundler.
   fs_utils::copy_dir(&data_dir.join("usr/"), &app_dir_path.join("usr/"))?;
 
+  // Bridge Tauri's resource_dir() lookup to where the resources actually live.
+  //
+  // Background: quick-sharun's binary patcher rewrites the hardcoded "lib"
+  // segment Tauri bakes into the binary (the install-prefix-relative resource
+  // root, e.g. `/usr/lib/<productName>/`) into a randomised `tmp/<lib_id>/`
+  // path to keep the AppImage host-isolated. At runtime, Tauri's resource_dir
+  // call resolves to `<AppDir>/tmp/<lib_id>/<productName>/…` — a path inside
+  // the AppDir that quick-sharun never populates. The host-side
+  // `/tmp/<lib_id>` symlink the path-mapping hook creates handles
+  // *library* lookups but not resource lookups, since Tauri builds the
+  // resource path relative to current_exe (not absolute), so the kernel
+  // resolves it inside the AppDir mount.
+  //
+  // Fix: pin quick-sharun's random lib_id to a known value (it honours the
+  // pre-set `_tmp_lib` env var) and pre-create `<AppDir>/tmp/<lib_id>` as a
+  // symlink to `../usr/lib`, where debian::generate_data placed the resources.
+  // The symlink ships inside the squashfs and the binary's resource_dir
+  // resolves transparently. quick-sharun never touches `<AppDir>/tmp/` so
+  // our pre-created symlink survives the packaging step.
+  const TAURI_LIB_ID: &str = "tauri";
+  let tmp_dir = app_dir_path.join("tmp");
+  fs::create_dir_all(&tmp_dir)?;
+  let tauri_lib_symlink = tmp_dir.join(TAURI_LIB_ID);
+  if tauri_lib_symlink.exists() {
+    fs::remove_file(&tauri_lib_symlink)?;
+  }
+  std::os::unix::fs::symlink("../usr/lib", &tauri_lib_symlink)?;
+
   let bins = settings.copy_binaries(&app_dir_path.join("usr/bin/"))?;
   let bins = bins
     .iter()
@@ -130,6 +158,7 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     )
     .env("ICON", &larger_icon.path)
     .env("OUTPUT_APPIMAGE", "1")
+    .env("_tmp_lib", TAURI_LIB_ID) // pin quick-sharun's lib_id so our symlink above matches
     //.env("URUNTIME2APPIMAGE_SOURCE", "https://raw.githubusercontent.com/FabianLars/Anylinux-AppImages/refs/heads/main/useful-tools/uruntime2appimage.sh")
     //.env("ADD_HOOKS", "fix-namespaces.hook")
     .args([
