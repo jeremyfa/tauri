@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+  collections::hash_map::DefaultHasher,
+  fs,
+  hash::{Hash, Hasher},
+  path::PathBuf,
+  process::Command,
+};
 
 use anyhow::Context;
 
@@ -132,10 +138,45 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   // The symlink ships inside the squashfs and the binary's resource_dir
   // resolves transparently. quick-sharun never touches `<AppDir>/tmp/` so
   // our pre-created symlink survives the packaging step.
-  const TAURI_LIB_ID: &str = "tauri";
+  //
+  // Length + uniqueness constraints on lib_id:
+  //   * quick-sharun does LENGTH-PRESERVING in-place binary patching — it
+  //     rewrites the literal `/usr/lib/` string (9 chars) to
+  //     `/tmp/<lib_id>/` (also 9 chars), which requires lib_id to be
+  //     EXACTLY 3 chars. Anything longer overruns the slot and silently
+  //     corrupts adjacent data; the resulting binary crashes immediately
+  //     with no output.
+  //   * The path-mapping hook does `ln -sfn $APPDIR/lib /tmp/<lib_id>` at
+  //     launch, force-overwriting any existing symlink. If two different
+  //     Tauri apps shared the same hardcoded lib_id, the second-launched
+  //     app would clobber the first's symlink, breaking the first's
+  //     library/resource lookups mid-execution. quick-sharun avoids this
+  //     in its default flow by generating a random 3-char id per app.
+  //
+  // Solution: derive lib_id deterministically from the product name so
+  // each app gets a stable, app-unique value. Same uniqueness guarantee
+  // as a random id (modulo hash collisions, which 36^3 ≈ 47k slots makes
+  // negligible across realistic Tauri-app populations), but predictable
+  // enough at build time to pre-create the matching symlink in the AppDir
+  // without parsing quick-sharun's output. Restricted to lowercase
+  // alphanumeric to stay inside quick-sharun's allowed regex
+  // `[A-Za-z0-9_=-]`.
+  let lib_id: String = {
+    let mut hasher = DefaultHasher::new();
+    settings.product_name().hash(&mut hasher);
+    let mut h = hasher.finish();
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let alpha_len = ALPHABET.len() as u64;
+    let mut s = String::with_capacity(3);
+    for _ in 0..3 {
+      s.push(ALPHABET[(h % alpha_len) as usize] as char);
+      h /= alpha_len;
+    }
+    s
+  };
   let tmp_dir = app_dir_path.join("tmp");
   fs::create_dir_all(&tmp_dir)?;
-  let tauri_lib_symlink = tmp_dir.join(TAURI_LIB_ID);
+  let tauri_lib_symlink = tmp_dir.join(&lib_id);
   if tauri_lib_symlink.exists() {
     fs::remove_file(&tauri_lib_symlink)?;
   }
@@ -158,7 +199,7 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     )
     .env("ICON", &larger_icon.path)
     .env("OUTPUT_APPIMAGE", "1")
-    .env("_tmp_lib", TAURI_LIB_ID) // pin quick-sharun's lib_id so our symlink above matches
+    .env("_tmp_lib", &lib_id) // pin quick-sharun's lib_id so our symlink above matches
     //.env("URUNTIME2APPIMAGE_SOURCE", "https://raw.githubusercontent.com/FabianLars/Anylinux-AppImages/refs/heads/main/useful-tools/uruntime2appimage.sh")
     //.env("ADD_HOOKS", "fix-namespaces.hook")
     .args([
